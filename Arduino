@@ -1,0 +1,246 @@
+#define BLYNK_TEMPLATE_ID "TMPL6G81GAVp1"
+#define BLYNK_TEMPLATE_NAME "Patient Health Monitor"
+#define BLYNK_PRINT Serial
+
+
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include "MAX30100_PulseOximeter.h"
+#include <Preferences.h> // เพิ่มไลบรารีสำหรับบันทึกข้อมูลลงหน่วยความจำ Flash (ตอบโจทย์ข้อ 4)
+
+
+// --- ข้อมูลการเชื่อมต่อ ---
+char auth[] = "U1TJlH2Hf-xgo0DQlkpaqzJEouE9xWeV"; // Auth Token
+char ssid[] = "Nang wifi";        // ชื่อ WiFi 
+char pass[] = "0982314145";       // รหัสผ่าน WiFi 
+
+
+// --- กำหนดขาอุปกรณ์ ---
+#define BUZZER_PIN 15
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+
+// --- ประกาศออบเจกต์ ---
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_MPU6050 mpu;
+PulseOximeter pox;
+BlynkTimer timer;
+Preferences preferences; // ออบเจกต์สำหรับจัดการหน่วยความจำ Flash ภายใน ESP32
+
+
+// --- ตัวแปรเก็บค่าเซ็นเซอร์ ---
+int heartRate = 0;
+int spO2 = 0;
+int fallAlert = 0;
+unsigned long fallTimer = 0;
+bool isOffline = false; // ตัวแปรเช็คสถานะการเชื่อมต่อ (ออนไลน์/ออฟไลน์)
+
+
+// ฟังก์ชันเมื่อตรวจพบจังหวะการเต้นของหัวใจ
+void onBeatDetected() {
+  // Serial.println("Beat Detected!");
+}
+
+
+// ฟังก์ชันตรวจจับการล้มและบันทึกค่าลงหน่วยความจำ
+void checkFall() {
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+
+
+  // คำนวณค่าแรงเร่งรวม (Total Acceleration Magnitude)
+  // แก้ไข: เติมเครื่องหมายคูณ (*) ที่ตกหล่นในโค้ดเดิมของคุณ
+  float accelMag = sqrt(a.acceleration.x * a.acceleration.x + 
+                        a.acceleration.y * a.acceleration.y + 
+                        a.acceleration.z * a.acceleration.z);
+
+
+  // เงื่อนไขตรวจจับการกระแทกหรือสภาวะการล้ม (ปกติค่า g โลก ≈ 9.8 m/s²)
+  if (accelMag > 25.0 || accelMag < 2.5) { 
+    fallAlert = 1;
+    fallTimer = millis(); // บันทึกเวลาที่เกิดการล้ม
+    digitalWrite(BUZZER_PIN, HIGH); // เสียง Buzzer ดังเตือน
+
+
+    // --- ส่วนประเมินความเสี่ยงและบันทึกข้อมูล (ตอบโจทย์ข้อ 2 และ 4) ---
+    // หากไม่มีสัญญาณ (ออฟไลน์) ให้บันทึกค่าความเสี่ยง/ปัจจัยสุขภาพลงหน่วยความจำถาวร
+    if (isOffline) {
+      int currentHR = (int)pox.getHeartRate();
+      int currentSpO2 = (int)pox.getSpO2();
+      
+      preferences.begin("health_data", false); // เปิดแฟ้มข้อมูลชื่อ health_data
+      preferences.putInt("saved_HR", currentHR); // บันทึกค่าชีพจรก่อนล้ม
+      preferences.putInt("saved_SpO2", currentSpO2); // บันทึกค่าออกซิเจนก่อนล้ม
+      preferences.putBool("fall_event", true); // บันทึกสถานะว่าเกิดการล้ม
+      preferences.end(); // ปิดการบันทึก
+      
+      Serial.println("Offline Fall Detected! Data saved to memory.");
+    }
+  }
+
+
+  // รีเซ็ตสถานะการล้มและเสียงเตือนอัตโนมัติเมื่อผ่านไป 5 วินาที
+  // แก้ไข: เติมเครื่องหมายลบ (-) ที่ตกหล่น
+  if (fallAlert == 1 && (millis() - fallTimer > 5000)) {
+    fallAlert = 0;
+    digitalWrite(BUZZER_PIN, LOW);
+  }
+}
+
+
+// ฟังก์ชันอ่านค่าและส่งข้อมูล
+void sendSensorData() {
+  heartRate = (int)pox.getHeartRate();
+  spO2 = (int)pox.getSpO2();
+
+
+  // ส่งค่าขึ้น Blynk Cloud (แพลตฟอร์มฟรี) เฉพาะเมื่อออนไลน์เท่านั้น (ตอบโจทย์ข้อ 3)
+  if (!isOffline) {
+    Blynk.virtualWrite(V0, heartRate);
+    Blynk.virtualWrite(V1, spO2);
+    Blynk.virtualWrite(V2, fallAlert);
+  }
+
+
+  // แสดงผลบนจอ OLED
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+
+
+  display.setCursor(10, 0);
+  display.println("PATIENT MONITOR");
+  display.println("---------------------");
+
+
+  display.setCursor(0, 20);
+  display.print("Heart Rate: ");
+  display.print(heartRate);
+  display.println(" bpm");
+
+
+  display.setCursor(0, 35);
+  display.print("SpO2:       ");
+  display.print(spO2);
+  display.println(" %");
+
+
+  display.setCursor(0, 50);
+  display.print("Fall Status: ");
+  if (fallAlert == 1) {
+    display.print("DETECTED! ");
+  } else {
+    display.print("NORMAL ");
+  }
+  
+  // แจ้งเตือนสถานะอินเทอร์เน็ตบนจอภาพ
+  if (isOffline) display.println("(OFF)");
+  else display.println("(ON)");
+
+
+  display.display();
+}
+
+
+void setup() {
+  Serial.begin(115200);
+
+
+  // ตั้งค่าขา Buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+
+  // กำหนดขา I2C (SDA = GPIO21, SCL = GPIO22)
+  Wire.begin(21, 22);
+
+
+  // เริ่มต้นจอ OLED
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("OLED SSD1306 allocation failed"));
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(15, 25);
+  display.println("System Starting...");
+  display.display();
+
+
+  // เริ่มต้น MPU6050
+  if (!mpu.begin()) {
+    Serial.println("MPU6050 Connection Failed");
+  } else {
+    Serial.println("MPU6050 Ready");
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+  }
+
+
+  // เริ่มต้น MAX30100
+  if (!pox.begin()) {
+    Serial.println("MAX30100 Connection Failed");
+  } else {
+    Serial.println("MAX30100 Ready");
+    pox.setOnBeatDetectedCallback(onBeatDetected);
+  }
+
+
+  // --- ระบบพยายามเชื่อมต่อเครือข่าย 10 ครั้ง หากไม่ได้ให้เข้าโหมดออฟไลน์ ---
+  display.clearDisplay();
+  display.setCursor(0, 20);
+  display.println("Connecting Wi-Fi...");
+  display.display();
+  
+  WiFi.begin(ssid, pass);
+  int retryCount = 0;
+  
+  // วนลูปเชื่อมต่อ 10 ครั้ง หน่วงเวลาครั้งละ 2 วินาที (ตอบโจทย์ข้อ 4)
+  while (WiFi.status() != WL_CONNECTED && retryCount < 10) {
+    delay(2000);
+    Serial.print(".");
+    retryCount++;
+  }
+
+
+  // ประเมินผลการเชื่อมต่อ
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWi-Fi Connected!");
+    Blynk.config(auth); // ใช้ config แทน begin เพื่อไม่ให้โปรแกรมค้าง
+    Blynk.connect();
+    isOffline = false;
+  } else {
+    Serial.println("\nWi-Fi Failed. Entering Offline Mode");
+    display.clearDisplay();
+    display.setCursor(0, 20);
+    display.println("Wi-Fi Failed!");
+    display.println("Running Offline...");
+    display.display();
+    delay(3000);
+    isOffline = true; // เปิดใช้งานโหมดออฟไลน์
+  }
+
+
+  // ตั้งเวลาส่งข้อมูลหรืออัปเดตหน้าจอทุก 1 วินาที
+  timer.setInterval(1000L, sendSensorData);
+}
+
+
+void loop() {
+  // รันระบบคลาวด์เฉพาะตอนที่มีสัญญาณเชื่อมต่อเท่านั้น
+  if (!isOffline) {
+    Blynk.run();
+  }
+  
+  timer.run();
+  
+  pox.update(); // อัปเดตการวัดค่าชีพจรเรื่อยๆ
+  checkFall();  // ตรวจจับการล้มพร้อมประเมินสถานะ
+}
